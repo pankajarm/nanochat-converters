@@ -348,15 +348,19 @@ def convert_nanochat_to_gguf(input_dir: str, output_file: str, dtype: str = "f16
     dummy_norm = np.ones(hidden_size, dtype=np.float32)
     needs_dummy_norms = arch in ("llama", "gpt2")
     
+    def to_numpy_transposed_same_shape(tensor: torch.Tensor):
+        """Transpose tensor then reshape back to original shape to flip logical layout after GGUF dim reversal."""
+        return to_numpy(tensor.T.contiguous().view_as(tensor))
+
     # Token embeddings
     # NOTE: HF stores embeddings as [vocab_size, hidden_size]
-    # GGUF stores row-major; loader handles access. Enforce expected shape.
+    # GGUF dims are reversed; use transposed-data-in-same-shape so stored logical is [hidden, vocab].
     if "model.embed_tokens.weight" in state_dict:
         emb = state_dict["model.embed_tokens.weight"]
         print(f"token_embd.weight HF shape: {emb.shape}")
         if emb.shape[0] != vocab_size or emb.shape[1] != hidden_size:
             raise ValueError(f"Embedding shape {emb.shape} != (vocab_size={vocab_size}, hidden_size={hidden_size})")
-        writer.add_tensor("token_embd.weight", to_numpy(emb))
+        writer.add_tensor("token_embd.weight", to_numpy_transposed_same_shape(emb))
     else:
         raise ValueError("Missing model.embed_tokens.weight!")
     
@@ -367,7 +371,7 @@ def convert_nanochat_to_gguf(input_dir: str, output_file: str, dtype: str = "f16
         print(f"output.weight HF shape: {lm_head.shape}")
         if lm_head.shape[0] != vocab_size or lm_head.shape[1] != hidden_size:
             raise ValueError(f"LM head shape {lm_head.shape} != (vocab_size={vocab_size}, hidden_size={hidden_size})")
-        writer.add_tensor("output.weight", to_numpy(lm_head))
+        writer.add_tensor("output.weight", to_numpy_transposed_same_shape(lm_head))
     else:
         raise ValueError("Missing lm_head.weight!")
     
@@ -415,8 +419,8 @@ def convert_nanochat_to_gguf(input_dir: str, output_file: str, dtype: str = "f16
         if fc1_key not in state_dict or fc2_key not in state_dict:
             raise ValueError(f"Missing MLP weights for layer {i}!")
         
-        fc1_np = to_numpy(state_dict[fc1_key])
-        fc2_np = to_numpy(state_dict[fc2_key])
+        fc1_np = to_numpy_transposed_same_shape(state_dict[fc1_key])
+        fc2_np = to_numpy_transposed_same_shape(state_dict[fc2_key])
         
         if arch == "nanochat":
             # Native NanoChat architecture: 2-layer MLP with relu2 (no duplication!)
