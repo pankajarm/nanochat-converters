@@ -250,10 +250,11 @@ def convert_nanochat_to_gguf(input_dir: str, output_file: str, dtype: str = "f16
     print("Loading tokenizer...")
     tokenizer_json_path = input_path / "tokenizer.json"
     
-    tokens = []
-    scores = []
-    toktypes = []
+    tokens: list[bytes] = []
+    scores: list[float] = []
+    toktypes: list[int] = []
     merges = []
+    tokenizer_vocab_size = None
     
     if tokenizer_json_path.exists():
         with open(tokenizer_json_path, "r", encoding="utf-8") as f:
@@ -261,10 +262,9 @@ def convert_nanochat_to_gguf(input_dir: str, output_file: str, dtype: str = "f16
         
         vocab = tokenizer_data.get("model", {}).get("vocab", {})
         merges = tokenizer_data.get("model", {}).get("merges", [])
-        
         if vocab:
+            tokenizer_vocab_size = len(vocab)
             token_id_to_str = {tid: tstr for tstr, tid in vocab.items()}
-            
             for token_id in range(vocab_size):
                 if token_id in token_id_to_str:
                     token_str = token_id_to_str[token_id]
@@ -286,6 +286,8 @@ def convert_nanochat_to_gguf(input_dir: str, output_file: str, dtype: str = "f16
                 else:
                     toktypes.append(5)  # UNUSED
             
+            if tokenizer_vocab_size != vocab_size:
+                print(f"⚠️ Tokenizer vocab ({tokenizer_vocab_size}) != config vocab_size ({vocab_size}), padding with <unused_*>")
             print(f"Loaded {len(vocab)} tokens, padded to {len(tokens)}")
     
     if not tokens:
@@ -294,6 +296,16 @@ def convert_nanochat_to_gguf(input_dir: str, output_file: str, dtype: str = "f16
             tokens.append(f"<token_{i}>".encode("utf-8"))
             scores.append(float(-i))
             toktypes.append(3 if i in (bos_token_id, eos_token_id) else 1)
+
+    # Final safety: if still short, pad to vocab_size with UNUSED tokens
+    if len(tokens) < vocab_size:
+        missing = vocab_size - len(tokens)
+        print(f"⚠️ Padding tokenizer with {missing} <unused_*> entries to reach vocab_size")
+        start = len(tokens)
+        for i in range(start, vocab_size):
+            tokens.append(f"<unused_{i}>".encode("utf-8"))
+            scores.append(float(-i))
+            toktypes.append(5)  # UNUSED
     
     assert len(tokens) == vocab_size, f"Token count {len(tokens)} != vocab_size {vocab_size}"
     
@@ -338,25 +350,24 @@ def convert_nanochat_to_gguf(input_dir: str, output_file: str, dtype: str = "f16
     
     # Token embeddings
     # NOTE: HF stores embeddings as [vocab_size, hidden_size]
-    # GGUF/llama.cpp expects [hidden_size, vocab_size] for ggml_get_rows
-    # So we need to transpose!
+    # GGUF stores row-major; loader handles access. Enforce expected shape.
     if "model.embed_tokens.weight" in state_dict:
         emb = state_dict["model.embed_tokens.weight"]
         print(f"token_embd.weight HF shape: {emb.shape}")
-        emb_t = emb.T  # Transpose to [hidden_size, vocab_size]
-        print(f"token_embd.weight GGUF shape (transposed): {emb_t.shape}")
-        writer.add_tensor("token_embd.weight", to_numpy(emb_t))
+        if emb.shape[0] != vocab_size or emb.shape[1] != hidden_size:
+            raise ValueError(f"Embedding shape {emb.shape} != (vocab_size={vocab_size}, hidden_size={hidden_size})")
+        writer.add_tensor("token_embd.weight", to_numpy(emb))
     else:
         raise ValueError("Missing model.embed_tokens.weight!")
     
     # Output head (lm_head)
-    # Same transpose needed - HF [vocab_size, hidden_size] -> GGUF [hidden_size, vocab_size]
+    # Same storage shape as embeddings
     if "lm_head.weight" in state_dict:
         lm_head = state_dict["lm_head.weight"]
         print(f"output.weight HF shape: {lm_head.shape}")
-        lm_head_t = lm_head.T  # Transpose
-        print(f"output.weight GGUF shape (transposed): {lm_head_t.shape}")
-        writer.add_tensor("output.weight", to_numpy(lm_head_t))
+        if lm_head.shape[0] != vocab_size or lm_head.shape[1] != hidden_size:
+            raise ValueError(f"LM head shape {lm_head.shape} != (vocab_size={vocab_size}, hidden_size={hidden_size})")
+        writer.add_tensor("output.weight", to_numpy(lm_head))
     else:
         raise ValueError("Missing lm_head.weight!")
     
@@ -509,9 +520,20 @@ def validate_gguf(gguf_path: str, expected_arch: str = None) -> bool:
         print(f"   Architecture: {arch}")
         print(f"   Vocab size: {vocab_size}")
         print(f"   Block count: {n_layers}")
-        
+
+        # Basic sanity checks
+        if arch is None:
+            print("   ❌ Missing architecture in GGUF metadata")
+            return False
         if expected_arch and arch != expected_arch:
-            print(f"   ⚠️ Expected architecture '{expected_arch}', got '{arch}'")
+            print(f"   ❌ Expected architecture '{expected_arch}', got '{arch}'")
+            return False
+        if vocab_size is None:
+            print("   ❌ Missing vocab_size in GGUF metadata")
+            return False
+        if n_layers is None:
+            print("   ❌ Missing block_count in GGUF metadata")
+            return False
         
         # Check tensors
         print(f"\n📊 Tensors: {len(reader.tensors)}")
@@ -1041,9 +1063,9 @@ Architecture Notes:
     parser.add_argument("--base-dtype", type=str, default=GGUF_BASE_DTYPE,
                         choices=["f16", "f32", "bf16"],
                         help="Base dtype for GGUF conversion")
-    parser.add_argument("--arch", type=str, default="llama",
+    parser.add_argument("--arch", type=str, default="nanochat",
                         choices=["nanochat", "llama", "gpt2"],
-                        help="GGUF architecture: 'nanochat' (native, requires llama.cpp support), 'llama' (workaround), 'gpt2' (workaround)")
+                        help="GGUF architecture: 'nanochat' (native, requires llama.cpp nanochat support), 'llama' (workaround), 'gpt2' (workaround)")
     parser.add_argument("--quantizations", type=str, nargs="*", default=GGUF_QUANTIZATIONS,
                         help="Additional quantizations to create (e.g., q4_K_M q6_K)")
     parser.add_argument("--work-dir", type=str, default=WORK_DIR,
