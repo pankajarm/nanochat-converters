@@ -93,7 +93,7 @@ GGUF_OUTPUT_DIR = f"{WORK_DIR}/gguf_models"
 # GGUF CONVERTER
 # ============================================================================
 
-def convert_nanochat_to_gguf(input_dir: str, output_file: str, dtype: str = "f16", arch: str = "llama") -> str:
+def convert_nanochat_to_gguf(input_dir: str, output_file: str, dtype: str = "f16", arch: str = "llama", disable_softcap: bool = False) -> str:
     """
     Convert NanoChat HuggingFace model to GGUF format.
     
@@ -171,7 +171,7 @@ def convert_nanochat_to_gguf(input_dir: str, output_file: str, dtype: str = "f16
     
     # Get activation function info from config (for documentation)
     hidden_act = config.get("hidden_act", "relu2")
-    final_logit_softcapping = config.get("final_logit_softcapping", 15.0)
+    final_logit_softcapping = 0.0 if disable_softcap else config.get("final_logit_softcapping", 15.0)
     
     # Verify vocab_size matches embedding tensor
     embed_key = "model.embed_tokens.weight"
@@ -1063,6 +1063,8 @@ Architecture Notes:
     parser.add_argument("--base-dtype", type=str, default=GGUF_BASE_DTYPE,
                         choices=["f16", "f32", "bf16"],
                         help="Base dtype for GGUF conversion")
+    parser.add_argument("--disable-softcap", action="store_true",
+                        help="Set final_logit_softcapping to 0 in GGUF metadata for testing")
     parser.add_argument("--arch", type=str, default="nanochat",
                         choices=["nanochat", "llama", "gpt2"],
                         help="GGUF architecture: 'nanochat' (native, requires llama.cpp nanochat support), 'llama' (workaround), 'gpt2' (workaround)")
@@ -1138,9 +1140,9 @@ Architecture Notes:
     base_gguf = f"{gguf_output_dir}/{model_name}-{args.base_dtype}.gguf"
     gguf_files = []
     
-    print(f"\n🔄 Creating base GGUF ({args.base_dtype}, arch={args.arch})...")
+    print(f"\n🔄 Creating base GGUF ({args.base_dtype}, arch={args.arch}) (softcap {'disabled' if args.disable_softcap else 'enabled'})...")
     try:
-        convert_nanochat_to_gguf(hf_source_dir, base_gguf, args.base_dtype, arch=args.arch)
+        convert_nanochat_to_gguf(hf_source_dir, base_gguf, args.base_dtype, arch=args.arch, disable_softcap=args.disable_softcap)
         gguf_files.append(base_gguf)
     except Exception as e:
         print(f"❌ Conversion failed: {e}")
