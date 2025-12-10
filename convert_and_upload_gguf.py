@@ -204,15 +204,20 @@ def convert_nanochat_to_gguf(input_dir: str, output_file: str, dtype: str = "f16
     np_dtype = np.float16 if dtype != "f32" else np.float32
     
     def to_numpy(tensor):
+        """Convert tensor to numpy without transposing.
+        
+        IMPORTANT: gguf-py reverses numpy shape when storing to GGML format.
+        So numpy shape (A, B) becomes GGML ne = [B, A].
+        
+        For PyTorch linear weights [out, in] -> numpy (out, in) -> GGML ne [in, out]
+        This matches llama.cpp's expected shape {in_dim, out_dim} for linear layers.
+        
+        For embeddings [vocab, hidden] -> numpy (vocab, hidden) -> GGML ne [hidden, vocab]
+        This matches llama.cpp's expected shape {hidden, vocab} for embeddings.
+        """
         if tensor.dtype == torch.bfloat16:
             tensor = tensor.to(torch.float32)
         return tensor.to(torch.float16 if dtype != "f32" else torch.float32).numpy()
-
-    def to_numpy_T(tensor):
-        """Transpose torch weight (out_dim, in_dim) -> (in_dim, out_dim) before numpy cast."""
-        if tensor.dtype == torch.bfloat16:
-            tensor = tensor.to(torch.float32)
-        return tensor.T.contiguous().to(torch.float16 if dtype != "f32" else torch.float32).numpy()
     
     def to_numpy_f32(tensor):
         """Always convert to f32 - used for norm weights that need to match compute precision."""
@@ -268,9 +273,23 @@ def convert_nanochat_to_gguf(input_dir: str, output_file: str, dtype: str = "f16
         
         vocab = tokenizer_data.get("model", {}).get("vocab", {})
         merges = tokenizer_data.get("model", {}).get("merges", [])
+        added_tokens = tokenizer_data.get("added_tokens", [])
+        
         if vocab:
             tokenizer_vocab_size = len(vocab)
             token_id_to_str = {tid: tstr for tstr, tid in vocab.items()}
+            
+            # Add special tokens from added_tokens section
+            special_token_ids = set()
+            for added_token in added_tokens:
+                tid = added_token.get("id")
+                content = added_token.get("content")
+                if tid is not None and content:
+                    token_id_to_str[tid] = content
+                    if added_token.get("special", False):
+                        special_token_ids.add(tid)
+            print(f"Added {len(added_tokens)} special tokens from added_tokens section")
+            
             for token_id in range(vocab_size):
                 if token_id in token_id_to_str:
                     token_str = token_id_to_str[token_id]
@@ -283,7 +302,9 @@ def convert_nanochat_to_gguf(input_dir: str, output_file: str, dtype: str = "f16
                 
                 if token_id in token_id_to_str:
                     token_str = token_id_to_str[token_id]
-                    if token_id == bos_token_id or token_id == eos_token_id or token_id == pad_token_id:
+                    if token_id in special_token_ids:
+                        toktypes.append(3)  # CONTROL
+                    elif token_id == bos_token_id or token_id == eos_token_id or token_id == pad_token_id:
                         toktypes.append(3)  # CONTROL
                     elif token_str.startswith("<") and token_str.endswith(">"):
                         toktypes.append(3)  # CONTROL
@@ -294,7 +315,7 @@ def convert_nanochat_to_gguf(input_dir: str, output_file: str, dtype: str = "f16
             
             if tokenizer_vocab_size != vocab_size:
                 print(f"⚠️ Tokenizer vocab ({tokenizer_vocab_size}) != config vocab_size ({vocab_size}), padding with <unused_*>")
-            print(f"Loaded {len(vocab)} tokens, padded to {len(tokens)}")
+            print(f"Loaded {len(vocab)} tokens from vocab + {len(added_tokens)} added tokens, total {len(tokens)}")
     
     if not tokens:
         print("Creating placeholder tokenizer...")
@@ -355,25 +376,26 @@ def convert_nanochat_to_gguf(input_dir: str, output_file: str, dtype: str = "f16
     needs_dummy_norms = arch in ("llama", "gpt2")
     
     # Token embeddings
-    # NOTE: HF stores embeddings as [vocab_size, hidden_size]
-    # GGUF dims are reversed; use transposed-data-in-same-shape so stored logical is [hidden, vocab].
+    # PyTorch stores embeddings as [vocab_size, hidden_size]
+    # gguf-py reverses: numpy (vocab, hidden) -> GGML ne [hidden, vocab]
+    # llama.cpp expects {hidden, vocab} - matches!
     if "model.embed_tokens.weight" in state_dict:
         emb = state_dict["model.embed_tokens.weight"]
-        print(f"token_embd.weight HF shape: {emb.shape}")
+        print(f"token_embd.weight HF shape: {emb.shape} -> GGML ne will be [{emb.shape[1]}, {emb.shape[0]}]")
         if emb.shape[0] != vocab_size or emb.shape[1] != hidden_size:
             raise ValueError(f"Embedding shape {emb.shape} != (vocab_size={vocab_size}, hidden_size={hidden_size})")
-        writer.add_tensor("token_embd.weight", to_numpy_T(emb))
+        writer.add_tensor("token_embd.weight", to_numpy(emb))
     else:
         raise ValueError("Missing model.embed_tokens.weight!")
     
     # Output head (lm_head)
-    # Same storage shape as embeddings
+    # Same as embeddings: PyTorch [vocab, hidden] -> GGML ne [hidden, vocab]
     if "lm_head.weight" in state_dict:
         lm_head = state_dict["lm_head.weight"]
-        print(f"output.weight HF shape: {lm_head.shape}")
+        print(f"output.weight HF shape: {lm_head.shape} -> GGML ne will be [{lm_head.shape[1]}, {lm_head.shape[0]}]")
         if lm_head.shape[0] != vocab_size or lm_head.shape[1] != hidden_size:
             raise ValueError(f"LM head shape {lm_head.shape} != (vocab_size={vocab_size}, hidden_size={hidden_size})")
-        writer.add_tensor("output.weight", to_numpy_T(lm_head))
+        writer.add_tensor("output.weight", to_numpy(lm_head))
     else:
         raise ValueError("Missing lm_head.weight!")
     
@@ -407,22 +429,26 @@ def convert_nanochat_to_gguf(input_dir: str, output_file: str, dtype: str = "f16
         blk = f"blk.{i}"
         
         # Attention projections (same for both architectures)
+        # PyTorch linear [out, in] -> gguf-py reverses -> GGML ne [in, out]
+        # llama.cpp expects {in_dim, out_dim} - matches!
         for src, dst in [("q_proj", "attn_q"), ("k_proj", "attn_k"), ("v_proj", "attn_v"), ("o_proj", "attn_output")]:
             key = f"{hf}.self_attn.{src}.weight"
             if key in state_dict:
-                writer.add_tensor(f"{blk}.{dst}.weight", to_numpy_T(state_dict[key]))
+                writer.add_tensor(f"{blk}.{dst}.weight", to_numpy(state_dict[key]))
             else:
                 raise ValueError(f"Missing {key}!")
         
         # MLP weights - architecture-dependent mapping
+        # PyTorch fc1 [intermediate, hidden] -> GGML ne [hidden, intermediate]
+        # PyTorch fc2 [hidden, intermediate] -> GGML ne [intermediate, hidden]
         fc1_key = f"{hf}.mlp.fc1.weight"
         fc2_key = f"{hf}.mlp.fc2.weight"
         
         if fc1_key not in state_dict or fc2_key not in state_dict:
             raise ValueError(f"Missing MLP weights for layer {i}!")
         
-        fc1_np = to_numpy_T(state_dict[fc1_key])
-        fc2_np = to_numpy_T(state_dict[fc2_key])
+        fc1_np = to_numpy(state_dict[fc1_key])
+        fc2_np = to_numpy(state_dict[fc2_key])
         
         if arch == "nanochat":
             # Native NanoChat architecture: 2-layer MLP with relu2 (no duplication!)
