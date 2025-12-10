@@ -207,6 +207,12 @@ def convert_nanochat_to_gguf(input_dir: str, output_file: str, dtype: str = "f16
         if tensor.dtype == torch.bfloat16:
             tensor = tensor.to(torch.float32)
         return tensor.to(torch.float16 if dtype != "f32" else torch.float32).numpy()
+
+    def to_numpy_T(tensor):
+        """Transpose torch weight (out_dim, in_dim) -> (in_dim, out_dim) before numpy cast."""
+        if tensor.dtype == torch.bfloat16:
+            tensor = tensor.to(torch.float32)
+        return tensor.T.contiguous().to(torch.float16 if dtype != "f32" else torch.float32).numpy()
     
     def to_numpy_f32(tensor):
         """Always convert to f32 - used for norm weights that need to match compute precision."""
@@ -348,10 +354,6 @@ def convert_nanochat_to_gguf(input_dir: str, output_file: str, dtype: str = "f16
     dummy_norm = np.ones(hidden_size, dtype=np.float32)
     needs_dummy_norms = arch in ("llama", "gpt2")
     
-    def to_numpy_transposed_same_shape(tensor: torch.Tensor):
-        """Transpose tensor then reshape back to original shape to flip logical layout after GGUF dim reversal."""
-        return to_numpy(tensor.T.contiguous().view_as(tensor))
-
     # Token embeddings
     # NOTE: HF stores embeddings as [vocab_size, hidden_size]
     # GGUF dims are reversed; use transposed-data-in-same-shape so stored logical is [hidden, vocab].
@@ -360,7 +362,7 @@ def convert_nanochat_to_gguf(input_dir: str, output_file: str, dtype: str = "f16
         print(f"token_embd.weight HF shape: {emb.shape}")
         if emb.shape[0] != vocab_size or emb.shape[1] != hidden_size:
             raise ValueError(f"Embedding shape {emb.shape} != (vocab_size={vocab_size}, hidden_size={hidden_size})")
-        writer.add_tensor("token_embd.weight", to_numpy_transposed_same_shape(emb))
+        writer.add_tensor("token_embd.weight", to_numpy_T(emb))
     else:
         raise ValueError("Missing model.embed_tokens.weight!")
     
@@ -371,7 +373,7 @@ def convert_nanochat_to_gguf(input_dir: str, output_file: str, dtype: str = "f16
         print(f"output.weight HF shape: {lm_head.shape}")
         if lm_head.shape[0] != vocab_size or lm_head.shape[1] != hidden_size:
             raise ValueError(f"LM head shape {lm_head.shape} != (vocab_size={vocab_size}, hidden_size={hidden_size})")
-        writer.add_tensor("output.weight", to_numpy_transposed_same_shape(lm_head))
+        writer.add_tensor("output.weight", to_numpy_T(lm_head))
     else:
         raise ValueError("Missing lm_head.weight!")
     
@@ -408,7 +410,7 @@ def convert_nanochat_to_gguf(input_dir: str, output_file: str, dtype: str = "f16
         for src, dst in [("q_proj", "attn_q"), ("k_proj", "attn_k"), ("v_proj", "attn_v"), ("o_proj", "attn_output")]:
             key = f"{hf}.self_attn.{src}.weight"
             if key in state_dict:
-                writer.add_tensor(f"{blk}.{dst}.weight", to_numpy(state_dict[key]))
+                writer.add_tensor(f"{blk}.{dst}.weight", to_numpy_T(state_dict[key]))
             else:
                 raise ValueError(f"Missing {key}!")
         
@@ -419,8 +421,8 @@ def convert_nanochat_to_gguf(input_dir: str, output_file: str, dtype: str = "f16
         if fc1_key not in state_dict or fc2_key not in state_dict:
             raise ValueError(f"Missing MLP weights for layer {i}!")
         
-        fc1_np = to_numpy_transposed_same_shape(state_dict[fc1_key])
-        fc2_np = to_numpy_transposed_same_shape(state_dict[fc2_key])
+        fc1_np = to_numpy_T(state_dict[fc1_key])
+        fc2_np = to_numpy_T(state_dict[fc2_key])
         
         if arch == "nanochat":
             # Native NanoChat architecture: 2-layer MLP with relu2 (no duplication!)
